@@ -1,0 +1,16 @@
+[package]
+name = "lazywm"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+x11rb = { version="0.11.1", features = ["xkb"]}
+thiserror = "1.0.38"
+strum_macros = "0.24.3"
+strum = "0.24.1"
+xkbcommon = "0.5.0"
+systemd-journal-logger = "0.7.0"
+log = "0.4.17"
+nix = "0.26.2"
