@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
-    process::{Command, Stdio},
+    collections::{HashMap, VecDeque},
+    process::{exit, Command, Stdio},
     rc::Rc,
 };
 
@@ -11,18 +11,20 @@ use x11rb::{
     connection::Connection,
     protocol::{
         xproto::{
-            ButtonIndex, ButtonMask, ButtonPressEvent, ChangeWindowAttributesAux, Circulate,
+            ButtonIndex, ButtonPressEvent, ChangeWindowAttributesAux, Circulate,
             ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateWindowAux, Cursor,
-            EventMask, FocusInEvent, FocusOutEvent, Font, GrabMode, KeyButMask, KeyPressEvent,
-            MapRequestEvent, MapState, ModMask, Screen, SetMode, StackMode, UnmapNotifyEvent,
-            Window,
+            EventMask, FocusInEvent, FocusOutEvent, Font, GrabMode, KeyPressEvent, MapRequestEvent,
+            MapState, ModMask, Screen, SetMode, StackMode, UnmapNotifyEvent, Window,
         },
         Event,
     },
     rust_connection::RustConnection,
 };
 
-use crate::x::{Error, Result};
+use crate::{
+    config::Config,
+    x::{Error, Result},
+};
 
 #[derive(
     AsRefStr, EnumIter, EnumString, Hash, PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy,
@@ -34,6 +36,8 @@ pub struct Client {
     client_win: Window,
 }
 
+type Handler = Box<dyn Fn(&WM) -> Result<()>>;
+
 pub struct WM {
     atoms: HashMap<Atom, u32>,
     conn: RustConnection,
@@ -42,12 +46,14 @@ pub struct WM {
     running: RefCell<bool>,
     focusing_client: RefCell<Option<Rc<Client>>>,
     // Stack of original client window
-    display_stack: RefCell<Vec<Window>>,
+    display_stack: RefCell<VecDeque<Window>>,
     normal_cursor: Cursor,
+    config: Config,
+    commands: HashMap<String, Handler>,
 }
 
 impl WM {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self> {
         let (conn, screen_num) = x11rb::connect(None).map_err(Error::from)?;
 
         let atom_requests = Atom::iter()
@@ -81,8 +87,64 @@ impl WM {
             running: RefCell::new(false),
             focusing_client: RefCell::new(None),
             normal_cursor,
-            display_stack: RefCell::new(Vec::new()),
+            display_stack: RefCell::new(VecDeque::new()),
+            config,
+            commands: Self::build_command_map(),
         })
+    }
+
+    fn build_command_map() -> HashMap<String, Handler> {
+        let mut map: HashMap<String, Handler> = HashMap::new();
+        map.insert(
+            "quit".into(),
+            Box::new(|_| {
+                exit(0);
+            }),
+        );
+        map.insert(
+            "focus_left".into(),
+            Box::new(|wm| {
+                wm.focus_left();
+                Ok(())
+            }),
+        );
+        map.insert(
+            "focus_right".into(),
+            Box::new(|wm| {
+                wm.focus_right();
+                Ok(())
+            }),
+        );
+        map.insert(
+            "launcher".into(),
+            Box::new(|_wm| {
+                WM::spawn("dmenu_run");
+                Ok(())
+            }),
+        );
+        map.insert(
+            "terminal".into(),
+            Box::new(|_| {
+                WM::spawn("alacritty");
+                Ok(())
+            }),
+        );
+        map.insert(
+            "close_window".into(),
+            Box::new(|wm| {
+                let top_of_stack = wm.display_stack.borrow_mut().pop_back();
+                if let Some(win) = top_of_stack {
+                    let clients = wm.clients.borrow_mut();
+                    let client = clients.get(&win).unwrap();
+                    println!("Focus: {:?}", client.client_win);
+                    wm.conn.kill_client(client.client_win).unwrap();
+                }
+                wm.focus_top();
+                Ok(())
+            }),
+        );
+
+        map
     }
 
     pub fn init(&self) {
@@ -168,8 +230,6 @@ impl WM {
         }
 
         let frame_win: Window = conn.generate_id().unwrap();
-        println!("Framing client win: {client_win}");
-        println!("Framing win: {frame_win}");
 
         let config = ConfigureWindowAux::new()
             .width(self.screen().width_in_pixels as u32)
@@ -217,13 +277,13 @@ impl WM {
         };
 
         self.grab_buttons(frame_win);
-        self.grab_keys(frame_win);
+        self.grab_keys(frame_win, "default");
         let client = Rc::new(client);
         let focusing_client = client.clone();
         self.clients.borrow_mut().insert(client_win, client);
         conn.map_window(client_win).unwrap();
         *self.focusing_client.borrow_mut() = Some(focusing_client);
-        (*self.display_stack.borrow_mut()).push(client_win);
+        (*self.display_stack.borrow_mut()).push_back(client_win);
     }
 
     fn handle_configure_request(&self, event: ConfigureRequestEvent) {
@@ -257,7 +317,7 @@ impl WM {
             .unwrap();
     }
 
-    fn grab_keys(&self, _window: Window) {
+    fn grab_keys(&self, _window: Window, mode: &str) {
         let conn = &self.conn;
         let setup = conn.setup();
         let max_keycode = setup.max_keycode;
@@ -271,26 +331,28 @@ impl WM {
         let keysyms_per_keycode = keymap.keysyms_per_keycode as usize;
 
         //(K - first_code) * keysyms_per_code_return + N
+        let config_key_map = self.config.get_key_maps(mode).expect("invalid mode");
 
         for k in min_keycode..=max_keycode {
             let idx = ((k - min_keycode) as usize) * keysyms_per_keycode;
             let keysym = keymap.keysyms[idx];
-            if xkbcommon::xkb::KEY_q == keysym
-                || xkbcommon::xkb::KEY_t == keysym
-                || xkbcommon::xkb::KEY_w == keysym
-                || xkbcommon::xkb::KEY_h == keysym
-            {
-                conn.grab_key(
-                    false,
-                    _window,
-                    ModMask::M1,
-                    k,
-                    GrabMode::ASYNC,
-                    GrabMode::ASYNC,
-                )
-                .unwrap()
-                .check()
-                .unwrap();
+
+            if config_key_map.contains_key(&keysym) {
+                let entry = &config_key_map[&keysym];
+                for (mod_mask, _) in entry {
+                    let mod_mask = mod_mask | self.config.get_mod_mask();
+                    conn.grab_key(
+                        false,
+                        _window,
+                        ModMask::from(mod_mask as u16),
+                        k,
+                        GrabMode::ASYNC,
+                        GrabMode::ASYNC,
+                    )
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                }
             }
         }
     }
@@ -310,6 +372,8 @@ impl WM {
                 clients.remove(&event.window);
             }
         }
+        let mut display_stack = self.display_stack.borrow_mut();
+        display_stack.retain(|&x| x != event.window);
     }
 
     fn handle_key_press(&self, event: KeyPressEvent) {
@@ -326,27 +390,21 @@ impl WM {
 
         //(K - first_code) * keysyms_per_code_return + N
         let keysym_index = (keycode - (setup.min_keycode as usize)) * keysyms_per_keycode;
-        let k = keymap.keysyms[keysym_index];
-        if (state) == KeyButMask::MOD1 {
-            // for k in &keymap.keysyms[range] {
-            if k == xkbcommon::xkb::KEY_w {
-                *self.running.borrow_mut() = false;
-            }
-            if k == xkbcommon::xkb::KEY_t {
-                WM::spawn("dmenu_run");
-            }
-            if k == xkbcommon::xkb::KEY_h {
-                self.focus_left();
-            }
-            if k == xkbcommon::xkb::KEY_q {
-                let top_of_stack = self.display_stack.borrow_mut().pop();
-                if let Some(win) = top_of_stack {
-                    let clients = self.clients.borrow_mut();
-                    let client = clients.get(&win).unwrap();
-                    println!("Focus: {:?}", client.client_win);
-                    conn.kill_client(client.client_win).unwrap();
+        let key_sym = keymap.keysyms[keysym_index];
+        let key_map = self.config.get_key_maps("default").unwrap();
+        let state: u32 = state.into();
+        if state != 0 {
+            let state = state & (!self.config.get_mod_mask());
+            if let Some(mod_map) = key_map.get(&key_sym) {
+                if let Some(handler_name) = mod_map.get(&state) {
+                    if let Some(handler) = self.commands.get(handler_name) {
+                        handler(self).unwrap();
+                    }
                 }
-                self.focus_top();
+            }
+        } else {
+            if key_sym == xkbcommon::xkb::KEY_Escape {
+                exit(0);
             }
         }
     }
@@ -363,8 +421,17 @@ impl WM {
     fn focus_left(&self) {
         {
             let mut stack = self.display_stack.borrow_mut();
-            if let Some(top_of_stack) = stack.pop() {
-                stack.insert(0, top_of_stack);
+            if let Some(top_of_stack) = stack.pop_back() {
+                stack.push_front(top_of_stack);
+            }
+        }
+        self.focus_top();
+    }
+    fn focus_right(&self) {
+        {
+            let mut stack = self.display_stack.borrow_mut();
+            if let Some(top_of_stack) = stack.pop_front() {
+                stack.push_back(top_of_stack);
             }
         }
         self.focus_top();
@@ -373,7 +440,7 @@ impl WM {
     fn focus(&self, window: Window) {
         let clients = self.clients.borrow();
         let client = clients.get(&window).unwrap();
-        println!("Focus: {:?}", client.client_win);
+
         self.conn
             .circulate_window(Circulate::RAISE_LOWEST, client.frame_win)
             .unwrap()
@@ -388,8 +455,6 @@ impl WM {
     }
 
     fn handle_button_press(&self, event: ButtonPressEvent) {
-        let conn = &self.conn;
-        let setup = conn.setup();
         println!("ButtonClicked on {}", event.event);
     }
 

@@ -1,0 +1,20 @@
+mod_key: Mod4
+#implicitly prefixed with <mod_key>
+#for example, <p> : <mod_key> + p
+modes:
+    default:
+        key_maps:
+            d: launcher
+            l: focus_right
+            h: focus_left
+            shift+h: move_left
+            shift+l: move_right
+            g: set_mod gaps
+            q: close_window
+            ctrl+alt+q: quit
+            t: terminal
+    gaps:
+        key_maps:
+            plus: gaps inner increase
+custom_commands:
+    launcher: rofi -show run
