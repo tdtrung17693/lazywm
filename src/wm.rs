@@ -23,6 +23,7 @@ use x11rb::{
 
 use crate::{
     config::Config,
+    wm_model::{Dimensionable, Positionable, WmState},
     x::{Error, Result},
 };
 
@@ -43,6 +44,7 @@ pub struct WM {
     conn: RustConnection,
     screen_num: usize,
     clients: RefCell<HashMap<Window, Rc<Client>>>,
+    window_frame_map: RefCell<HashMap<Window, Window>>,
     running: RefCell<bool>,
     focusing_client: RefCell<Option<Rc<Client>>>,
     // Stack of original client window
@@ -50,6 +52,7 @@ pub struct WM {
     normal_cursor: Cursor,
     config: Config,
     commands: HashMap<String, Handler>,
+    wm_state: RefCell<WmState>,
 }
 
 impl WM {
@@ -78,23 +81,45 @@ impl WM {
             .unwrap()
             .check()
             .unwrap();
-
+        let commands = Self::build_command_map(config.get_custom_commands());
+        let screen = conn.setup().roots.get(screen_num).unwrap();
+        let width = screen.width_in_pixels as u32;
+        let height = screen.height_in_pixels as u32;
+        let wm_state = WmState::new(1, width, height);
         Ok(Self {
             atoms,
             conn,
             clients: RefCell::new(HashMap::new()),
+            window_frame_map: RefCell::new(HashMap::new()),
             screen_num,
             running: RefCell::new(false),
             focusing_client: RefCell::new(None),
             normal_cursor,
             display_stack: RefCell::new(VecDeque::new()),
             config,
-            commands: Self::build_command_map(),
+            commands,
+            wm_state: RefCell::new(wm_state),
         })
     }
 
-    fn build_command_map() -> HashMap<String, Handler> {
-        let mut map: HashMap<String, Handler> = HashMap::new();
+    fn build_command_map<'a>(
+        custom_commands: Option<&'a HashMap<String, String>>,
+    ) -> HashMap<String, Handler> {
+        let mut map: HashMap<String, Handler> = if let Some(custom_commands) = custom_commands {
+            custom_commands
+                .iter()
+                .map(|(k, v)| {
+                    let v = v.clone();
+                    let handler: Handler = Box::new(move |_wm| {
+                        WM::spawn(&v);
+                        Ok(())
+                    });
+                    (k.clone(), handler)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         map.insert(
             "quit".into(),
             Box::new(|_| {
@@ -112,13 +137,6 @@ impl WM {
             "focus_right".into(),
             Box::new(|wm| {
                 wm.focus_right();
-                Ok(())
-            }),
-        );
-        map.insert(
-            "launcher".into(),
-            Box::new(|_wm| {
-                WM::spawn("dmenu_run");
                 Ok(())
             }),
         );
@@ -199,6 +217,36 @@ impl WM {
                 Event::FocusOut(xev) => self.handle_focus_out(xev),
                 _ => {}
             }
+
+            let binding = self.wm_state.borrow_mut();
+            let repositioned_windows = binding.get_repositioned_windows();
+            repositioned_windows.iter().for_each(|w| {
+                let c = *w;
+                let (width, height) = c.get_dimensions();
+                let (x, y) = c.get_position();
+                self.conn
+                    .configure_window(
+                        w.frame_win_id.unwrap(),
+                        &ConfigureWindowAux::new()
+                            .width(width)
+                            .height(height)
+                            .x(x as i32)
+                            .y(y as i32),
+                    )
+                    .unwrap();
+                if let Some(main_win_id) = w.main_win_id {
+                    self.conn
+                        .configure_window(
+                            main_win_id,
+                            &ConfigureWindowAux::new()
+                                .width(width)
+                                .height(height)
+                                .x(0)
+                                .y(0),
+                        )
+                        .unwrap();
+                }
+            });
         }
     }
 
@@ -252,38 +300,35 @@ impl WM {
                     | EventMask::ENTER_WINDOW,
             );
 
+        let mut wm_state = self.wm_state.borrow_mut();
+        let new_container = wm_state.new_window(client_win);
+        let (width, height) = new_container.get_dimensions();
+        let (x, y) = new_container.get_position();
+        new_container.frame_win_id = Some(frame_win);
         conn.create_window(
             screen.root_depth,
             frame_win,
             screen.root,
-            client_win_geometry.x,
-            client_win_geometry.y,
-            self.screen().width_in_pixels,
-            self.screen().height_in_pixels,
+            x as i16,
+            y as i16,
+            width as u16,
+            height as u16,
             client_win_geometry.border_width,
             client_win_attrs.class,
             screen.root_visual,
             &attrs,
         )
         .unwrap();
-
         conn.change_save_set(SetMode::INSERT, client_win).unwrap();
         conn.reparent_window(client_win, frame_win, 0, 0).unwrap();
         conn.map_window(frame_win).unwrap();
 
-        let client = Client {
-            frame_win,
-            client_win,
-        };
-
         self.grab_buttons(frame_win);
         self.grab_keys(frame_win, "default");
-        let client = Rc::new(client);
-        let focusing_client = client.clone();
-        self.clients.borrow_mut().insert(client_win, client);
         conn.map_window(client_win).unwrap();
-        *self.focusing_client.borrow_mut() = Some(focusing_client);
-        (*self.display_stack.borrow_mut()).push_back(client_win);
+        self.window_frame_map
+            .borrow_mut()
+            .insert(client_win, frame_win);
     }
 
     fn handle_configure_request(&self, event: ConfigureRequestEvent) {
@@ -361,19 +406,21 @@ impl WM {
         let conn = &self.conn;
         let screen = self.screen();
 
-        let mut clients = self.clients.borrow_mut();
-        if let Some(client) = clients.get(&event.window) {
+        let mut window_frame_map = self.window_frame_map.borrow_mut();
+        if let Some(frame_win_id) = window_frame_map.get(&event.window) {
             conn.change_save_set(SetMode::DELETE, event.window).unwrap();
 
             conn.reparent_window(event.window, screen.root, 0, 0)
                 .unwrap();
-            conn.destroy_window(client.frame_win).unwrap();
+            conn.destroy_window(*frame_win_id).unwrap();
             {
-                clients.remove(&event.window);
+                window_frame_map.remove(&event.window);
             }
         }
         let mut display_stack = self.display_stack.borrow_mut();
         display_stack.retain(|&x| x != event.window);
+        let mut wm_state = self.wm_state.borrow_mut();
+        wm_state.remove_window(event.window);
     }
 
     fn handle_key_press(&self, event: KeyPressEvent) {

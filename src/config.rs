@@ -99,6 +99,10 @@ impl Config {
     pub(crate) fn get_mod_mask(&self) -> u32 {
         return self.mod_key;
     }
+
+    pub(crate) fn get_custom_commands(&self) -> Option<&HashMap<String, String>> {
+        return self.custom_commands.as_ref();
+    }
 }
 
 pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Error>> {
