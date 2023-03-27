@@ -7,9 +7,10 @@ modes:
             d: launcher
             l: focus_right
             h: focus_left
+            s: toggle_layout
             shift+h: move_left
             shift+l: move_right
-            g: set_mod gaps
+            g: set_mode gaps
             q: close_window
             ctrl+alt+q: quit
             t: terminal

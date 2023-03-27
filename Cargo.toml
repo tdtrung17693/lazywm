@@ -16,3 +16,4 @@ log = "0.4.17"
 nix = "0.26.2"
 serde_yaml = "0.9"
 serde = { version = "1.0.156", features = ["derive"] }
+clap = { version = "4.1.13", features = ["derive"] }
