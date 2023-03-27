@@ -53,6 +53,7 @@ pub struct WM {
     config: Config,
     commands: HashMap<String, Handler>,
     wm_state: RefCell<WmState>,
+    wm_mode: String,
 }
 
 impl WM {
@@ -99,6 +100,7 @@ impl WM {
             config,
             commands,
             wm_state: RefCell::new(wm_state),
+            wm_mode: "default".into(),
         })
     }
 
@@ -150,14 +152,18 @@ impl WM {
         map.insert(
             "close_window".into(),
             Box::new(|wm| {
-                let top_of_stack = wm.display_stack.borrow_mut().pop_back();
-                if let Some(win) = top_of_stack {
-                    let clients = wm.clients.borrow_mut();
-                    let client = clients.get(&win).unwrap();
-                    println!("Focus: {:?}", client.client_win);
-                    wm.conn.kill_client(client.client_win).unwrap();
+                // let top_of_stack = wm.display_stack.borrow_mut().pop_back();
+                let wm_state = wm.wm_state.borrow();
+                let focusing_container = wm_state.get_focusing_container();
+                if let Some(container) = focusing_container {
+                    if let Some(window_id) = container.main_win_id {
+                        wm.conn.kill_client(window_id).unwrap();
+                    } else {
+                        wm.conn
+                            .kill_client(container.frame_win_id.unwrap())
+                            .unwrap();
+                    }
                 }
-                wm.focus_top();
                 Ok(())
             }),
         );
@@ -219,7 +225,7 @@ impl WM {
             }
 
             let binding = self.wm_state.borrow_mut();
-            let repositioned_windows = binding.get_repositioned_windows();
+            let repositioned_windows = binding.get_repositioned_containers();
             repositioned_windows.iter().for_each(|w| {
                 let c = *w;
                 let (width, height) = c.get_dimensions();
@@ -301,10 +307,9 @@ impl WM {
             );
 
         let mut wm_state = self.wm_state.borrow_mut();
-        let new_container = wm_state.new_window(client_win);
+        let new_container = wm_state.new_container(client_win, frame_win);
         let (width, height) = new_container.get_dimensions();
         let (x, y) = new_container.get_position();
-        new_container.frame_win_id = Some(frame_win);
         conn.create_window(
             screen.root_depth,
             frame_win,
@@ -345,21 +350,21 @@ impl WM {
     }
 
     fn grab_buttons(&self, _window: Window) {
-        self.conn
-            .grab_button(
-                false,
-                _window,
-                EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                self.screen().root,
-                self.normal_cursor,
-                ButtonIndex::ANY,
-                ModMask::ANY,
-            )
-            .unwrap()
-            .check()
-            .unwrap();
+        // self.conn
+        //     .grab_button(
+        //         false,
+        //         _window,
+        //         EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
+        //         GrabMode::ASYNC,
+        //         GrabMode::ASYNC,
+        //         self.screen().root,
+        //         self.normal_cursor,
+        //         ButtonIndex::ANY,
+        //         ModMask::from(self.config.get_mod_mask() as u16),
+        //     )
+        //     .unwrap()
+        //     .check()
+        //     .unwrap();
     }
 
     fn grab_keys(&self, _window: Window, mode: &str) {
@@ -407,20 +412,31 @@ impl WM {
         let screen = self.screen();
 
         let mut window_frame_map = self.window_frame_map.borrow_mut();
-        if let Some(frame_win_id) = window_frame_map.get(&event.window) {
+        if let Some(_) = window_frame_map.get(&event.window) {
             conn.change_save_set(SetMode::DELETE, event.window).unwrap();
-
             conn.reparent_window(event.window, screen.root, 0, 0)
                 .unwrap();
-            conn.destroy_window(*frame_win_id).unwrap();
-            {
-                window_frame_map.remove(&event.window);
-            }
+            window_frame_map.remove(&event.window);
+        } else {
+            // remove the frame, no need to continue processing
+            return;
         }
-        let mut display_stack = self.display_stack.borrow_mut();
-        display_stack.retain(|&x| x != event.window);
+
         let mut wm_state = self.wm_state.borrow_mut();
-        wm_state.remove_window(event.window);
+        wm_state.remove_container(event.window);
+        let removed_containers = wm_state.get_removed_containers();
+        // println!(
+        //     "removed containers: {:?}",
+        //     removed_containers
+        //         .iter()
+        //         .map(|c| c.frame_win_id)
+        //         .collect::<Vec<_>>()
+        // );
+        for c in removed_containers {
+            let Some(frame_win_id ) = c.frame_win_id else { continue;};
+            conn.destroy_window(frame_win_id).unwrap();
+        }
+        wm_state.clean_removed_containers();
     }
 
     fn handle_key_press(&self, event: KeyPressEvent) {
