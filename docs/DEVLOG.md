@@ -10,8 +10,13 @@
     + ICCCM / EWMH 
 
 ## Mar 18, 2023
-Allow user to configure the WM at runtime using a YAML file.
+- Allow user to configure the WM at runtime using a YAML file.
 
-The configuration file will be structured as in the [example configuration file](../examples/config.yaml).
+- The configuration file will be structured as in the [example configuration file](../examples/config.yaml).
 
-Currently, only default configuration are supported. The file must be placed in `$XDG_CONFIG_HOME/lazywm`.
+- Currently, only default configuration are supported. The file must be placed in `$XDG_CONFIG_HOME/lazywm`.
+
+## Mar 29, 2023
+- Refactor to separate rendering and state of the WM.
+- Horizontal layout is basically implemented.
+![](horizontal-layout.png)

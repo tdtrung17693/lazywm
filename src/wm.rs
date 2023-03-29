@@ -1,24 +1,31 @@
 use std::{
+    borrow::Borrow,
     cell::RefCell,
     collections::{HashMap, VecDeque},
     process::{exit, Command, Stdio},
     rc::Rc,
 };
 
+use log::info;
 use strum::IntoEnumIterator;
 use strum_macros::{AsRefStr, EnumIter, EnumString};
 use x11rb::{
     connection::Connection,
+    cursor,
     protocol::{
+        xkb::SelectEventsAux,
         xproto::{
             ButtonIndex, ButtonPressEvent, ChangeWindowAttributesAux, Circulate,
             ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateWindowAux, Cursor,
-            EventMask, FocusInEvent, FocusOutEvent, Font, GrabMode, KeyPressEvent, MapRequestEvent,
-            MapState, ModMask, Screen, SetMode, StackMode, UnmapNotifyEvent, Window,
+            EnterNotifyEvent, EventMask, FocusInEvent, FocusOutEvent, Font, GrabMode, InputFocus,
+            KeyPressEvent, MapRequestEvent, MapState, ModMask, Screen, SetMode, StackMode,
+            UnmapNotifyEvent, Window,
         },
         Event,
     },
+    resource_manager,
     rust_connection::RustConnection,
+    CURRENT_TIME,
 };
 
 use crate::{
@@ -26,6 +33,8 @@ use crate::{
     wm_model::{Dimensionable, Positionable, WmState},
     x::{Error, Result},
 };
+
+use log::error;
 
 #[derive(
     AsRefStr, EnumIter, EnumString, Hash, PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy,
@@ -45,6 +54,7 @@ pub struct WM {
     screen_num: usize,
     clients: RefCell<HashMap<Window, Rc<Client>>>,
     window_frame_map: RefCell<HashMap<Window, Window>>,
+
     running: RefCell<bool>,
     focusing_client: RefCell<Option<Rc<Client>>>,
     // Stack of original client window
@@ -199,6 +209,21 @@ impl WM {
             self.frame(w, true);
         }
         self.conn.ungrab_server().unwrap().check().unwrap();
+        let db = resource_manager::new_from_default(&self.conn).unwrap();
+        let cursor_handler = cursor::Handle::new(&self.conn, self.screen_num, &db)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let left_ptr = cursor_handler.load_cursor(&self.conn, "left_ptr").unwrap();
+
+        self.conn
+            .change_window_attributes(
+                self.screen().root,
+                &ChangeWindowAttributesAux::default().cursor(left_ptr),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
         self.conn.flush().unwrap();
     }
 
@@ -221,6 +246,7 @@ impl WM {
                 Event::ButtonPress(xev) => self.handle_button_press(xev),
                 Event::FocusIn(xev) => self.handle_focus_in(xev),
                 Event::FocusOut(xev) => self.handle_focus_out(xev),
+                Event::EnterNotify(xev) => self.handle_enter_window(xev),
                 _ => {}
             }
 
@@ -260,6 +286,34 @@ impl WM {
         self.conn.setup().roots.get(self.screen_num).unwrap()
     }
 
+    fn handle_enter_window(&self, event: EnterNotifyEvent) {
+        if !self.window_frame_map.borrow().contains_key(&event.event) {
+            return;
+        }
+        info!("Enter window: {:#?}", event.event);
+        if let Err(e) = self
+            .conn
+            .set_input_focus(InputFocus::POINTER_ROOT, event.event, CURRENT_TIME)
+            .unwrap()
+            .check()
+        {
+            error!("Failed to set input focus: {}", e)
+        }
+        info!(
+            "Set focus to: {} - frame: {:#?} - main: {:#?}",
+            event.event,
+            self.window_frame_map.borrow().get(&event.event),
+            self.window_frame_map
+                .borrow()
+                .values()
+                .find(|&&v| v == event.event)
+        );
+
+        self.wm_state
+            .borrow_mut()
+            .set_focusing_container(event.event);
+    }
+
     fn handle_map_request(&self, event: MapRequestEvent) {
         let client_win = event.window;
         self.frame(client_win, false);
@@ -285,26 +339,18 @@ impl WM {
 
         let frame_win: Window = conn.generate_id().unwrap();
 
-        let config = ConfigureWindowAux::new()
-            .width(self.screen().width_in_pixels as u32)
-            .height(self.screen().height_in_pixels as u32);
-        conn.configure_window(client_win, &config)
-            .unwrap()
-            .check()
-            .unwrap();
+        // let config = ConfigureWindowAux::new()
+        //     .width(self.screen().width_in_pixels as u32)
+        //     .height(self.screen().height_in_pixels as u32);
+        // conn.configure_window(client_win, &config)
+        //     .unwrap()
+        //     .check()
+        //     .unwrap();
         let attrs = CreateWindowAux::new()
-            .background_pixel(0x0000ff)
-            .border_pixel(0xff0000)
-            .event_mask(
-                EventMask::SUBSTRUCTURE_REDIRECT
-                    | EventMask::SUBSTRUCTURE_NOTIFY
-                    | EventMask::BUTTON_PRESS
-                    | EventMask::BUTTON_RELEASE
-                    | EventMask::KEY_PRESS
-                    | EventMask::KEY_RELEASE
-                    | EventMask::POINTER_MOTION
-                    | EventMask::ENTER_WINDOW,
-            );
+            .background_pixel(screen.black_pixel)
+            .border_pixel(screen.black_pixel)
+            .override_redirect(1)
+            .event_mask(EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY);
 
         let mut wm_state = self.wm_state.borrow_mut();
         let new_container = wm_state.new_container(client_win, frame_win);
@@ -330,7 +376,14 @@ impl WM {
 
         self.grab_buttons(frame_win);
         self.grab_keys(frame_win, "default");
+        let config = ChangeWindowAttributesAux::default()
+            .event_mask(EventMask::ENTER_WINDOW | EventMask::FOCUS_CHANGE);
+        conn.change_window_attributes(client_win, &config).unwrap();
         conn.map_window(client_win).unwrap();
+        conn.set_input_focus(InputFocus::POINTER_ROOT, client_win, CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
         self.window_frame_map
             .borrow_mut()
             .insert(client_win, frame_win);
@@ -437,6 +490,15 @@ impl WM {
             conn.destroy_window(frame_win_id).unwrap();
         }
         wm_state.clean_removed_containers();
+        let Some(focusing_container) = wm_state.get_focusing_container() else {
+            return
+        };
+        let Some(focusing_window_id) = focusing_container.main_win_id else {return};
+        self.conn
+            .set_input_focus(InputFocus::POINTER_ROOT, focusing_window_id, CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
     }
 
     fn handle_key_press(&self, event: KeyPressEvent) {
@@ -518,7 +580,12 @@ impl WM {
     }
 
     fn handle_button_press(&self, event: ButtonPressEvent) {
-        println!("ButtonClicked on {}", event.event);
+        info!("ButtonClicked on {}", event.event);
+        self.conn
+            .set_input_focus(InputFocus::POINTER_ROOT, event.event, CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
     }
 
     fn spawn<S: Into<String>>(cmd: S) {
@@ -544,7 +611,7 @@ impl WM {
     }
 
     fn handle_focus_in(&self, event: FocusInEvent) {
-        println!("FocusIn: {}", event.event);
+        info!("FocusIn: {}", event.event);
     }
 
     fn handle_focus_out(&self, event: FocusOutEvent) {

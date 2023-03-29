@@ -68,6 +68,7 @@ pub struct Container {
     geometry: Geometry,
     is_repositioned: bool,
     remove_flag: bool,
+    parent: Option<*mut Container>,
 }
 
 trait Framable {
@@ -258,6 +259,7 @@ pub struct Workspace {
     /// A focused client is always a parent frame that binded to a container
     /// or a application window, both of them are framable
     current_focused_frame_id: Option<FrameId>,
+    current_focused_container: *mut Container,
     // root container
     container: Container,
 }
@@ -268,19 +270,25 @@ impl Workspace {
     }
 
     fn remove_container(&mut self, window_id: u32) {
-        let root_container = &mut self.container;
+        let root_container = &mut self.container as *mut Container;
         let parent_container =
             Self::find_parent_container(root_container, &mut |c| c.main_win_id == Some(window_id));
         if let Some(parent_container) = parent_container {
-            let next_focusing_container = parent_container.get_next_focusing_container(window_id);
-            self.current_focused_frame_id =
-                if let Some(next_focusing_container) = next_focusing_container {
-                    next_focusing_container.frame_win_id
-                } else {
-                    None
-                };
+            unsafe {
+                let parent_container = &mut *parent_container;
+                let next_focusing_container =
+                    parent_container.get_next_focusing_container(window_id);
+                self.current_focused_container =
+                    if let Some(next_focusing_container) = next_focusing_container {
+                        next_focusing_container as *const Container as *mut Container
+                    } else if parent_container.parent.is_some() {
+                        parent_container.parent.unwrap() as *const Container as *mut Container
+                    } else {
+                        root_container
+                    };
 
-            parent_container.remove_window(window_id);
+                parent_container.remove_window(window_id);
+            }
         }
     }
 
@@ -297,41 +305,61 @@ impl Workspace {
     }
 
     fn find_parent_container<'a>(
-        root: &'a mut Container,
+        root: *mut Container,
         pred: &impl Fn(&mut Container) -> bool,
-    ) -> Option<&'a mut Container> {
-        let mut found = Err(());
+    ) -> Option<*mut Container> {
+        unsafe {
+            let root = &mut *root;
+            let mut found = Err(());
 
-        for (i, child) in root.children.iter_mut().enumerate() {
-            if pred(child) {
-                found = Ok(None);
-                break;
-            } else if Self::find_parent_container(child, pred).is_some() {
-                found = Ok(Some(i));
-                break;
+            for (i, child) in root.children.iter_mut().enumerate() {
+                if pred(child) {
+                    found = Ok(None);
+                    break;
+                } else if Self::find_parent_container(child, pred).is_some() {
+                    found = Ok(Some(i));
+                    break;
+                }
             }
-        }
-        match found {
-            Ok(Some(i)) => Some(&mut root.children[i]),
-            Ok(None) => Some(root),
-            Err(()) => None,
+            match found {
+                Ok(Some(i)) => Some(&mut root.children[i]),
+                Ok(None) => Some(root),
+                Err(()) => None,
+            }
         }
     }
 
     fn add_container<'a>(&'a mut self, new_container: Container) -> &'a mut Container {
         let root_container = &mut self.container;
         info!("root container: {:#?}", root_container);
-        let parent_container = if let Some(focused_frame_id) = self.current_focused_frame_id {
-            Self::find_parent_container(root_container, &|c| {
-                c.frame_win_id == Some(focused_frame_id)
-            })
-        } else {
-            Some(root_container)
+        let parent_container = unsafe {
+            let focusing_container = &mut *self.current_focused_container;
+            if focusing_container.parent.is_none() {
+                root_container
+            } else {
+                focusing_container.parent.unwrap()
+            }
         };
 
-        self.current_focused_frame_id = Some(new_container.frame_win_id.unwrap());
-        let added_container = parent_container.unwrap().add_child(new_container);
+        let added_container = unsafe { &mut *parent_container }.add_child(new_container);
+        self.current_focused_container = added_container as *mut Container;
+        added_container.parent = Some(parent_container);
         added_container
+    }
+
+    fn set_current_focused_container(&mut self, window_id: WindowId) {
+        let root_container = &mut self.container as *mut Container;
+        let Some(parent_container) =
+            Self::find_parent_container(root_container, &mut |c| c.main_win_id == Some(window_id)) else {return;};
+        let parent_container = unsafe { &mut *parent_container };
+        let Some(container) = parent_container
+            .children
+            .iter()
+            .find(|&c| c.main_win_id == Some(window_id))
+            .map(|c| c as *const Container as *mut Container) else {
+                return
+            };
+        self.current_focused_container = container;
     }
 }
 
@@ -359,13 +387,16 @@ impl WmState {
                 },
                 is_repositioned: false,
                 remove_flag: false,
+                parent: None,
             };
+            let focus_pointer = &container as *const Container as *mut Container;
             workspaces.insert(
                 i,
                 Workspace {
                     display_stack: VecDeque::new(),
                     current_focused_frame_id: None,
                     container,
+                    current_focused_container: focus_pointer,
                 },
             );
         }
@@ -391,18 +422,23 @@ impl WmState {
             },
             is_repositioned: false,
             remove_flag: false,
+            parent: None,
         };
         let added_container = workspace.add_container(new_container);
         return added_container;
     }
 
     pub fn remove_container(&mut self, window_id: WindowId) {
-        let workspace = self.workspaces.get_mut(&self.current_workspace).unwrap();
+        let workspace = self.get_current_workspace_mut();
         workspace.remove_container(window_id);
     }
 
     pub fn get_current_workspace(&self) -> &Workspace {
         self.workspaces.get(&self.current_workspace).unwrap()
+    }
+
+    pub fn get_current_workspace_mut(&mut self) -> &mut Workspace {
+        self.workspaces.get_mut(&self.current_workspace).unwrap()
     }
 
     pub fn reposition(&mut self) {
@@ -433,11 +469,20 @@ impl WmState {
         self.current_workspace = workspace;
     }
 
+    pub fn set_focusing_container(&mut self, window_id: WindowId) {
+        let workspace = self.get_current_workspace_mut();
+        workspace.set_current_focused_container(window_id);
+    }
+
     pub fn get_focusing_container(&self) -> Option<&Container> {
         let workspace = self.workspaces.get(&self.current_workspace).unwrap();
-        let current_focused = workspace.current_focused_frame_id;
-        if let Some(frame_win_id) = current_focused {
-            return workspace.container.find_container_by_frame_id(frame_win_id);
+        let current_focused_container = unsafe { &*workspace.current_focused_container };
+        info!(
+            "current focused container: {:#?}",
+            current_focused_container
+        );
+        if current_focused_container.frame_win_id.is_some() {
+            return Some(current_focused_container);
         }
 
         return None;
