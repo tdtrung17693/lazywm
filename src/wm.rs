@@ -1,5 +1,4 @@
 use std::{
-    borrow::Borrow,
     cell::RefCell,
     collections::{HashMap, VecDeque},
     process::{exit, Command, Stdio},
@@ -13,13 +12,12 @@ use x11rb::{
     connection::Connection,
     cursor,
     protocol::{
-        xkb::SelectEventsAux,
         xproto::{
-            ButtonIndex, ButtonPressEvent, ChangeWindowAttributesAux, Circulate,
-            ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateWindowAux, Cursor,
-            EnterNotifyEvent, EventMask, FocusInEvent, FocusOutEvent, Font, GrabMode, InputFocus,
-            KeyPressEvent, MapRequestEvent, MapState, ModMask, Screen, SetMode, StackMode,
-            UnmapNotifyEvent, Window,
+            ButtonPressEvent, ChangeWindowAttributesAux, Circulate, ConfigureRequestEvent,
+            ConfigureWindowAux, ConnectionExt, CreateWindowAux, Cursor, EnterNotifyEvent,
+            EventMask, FocusInEvent, FocusOutEvent, Font, GrabMode, InputFocus, KeyPressEvent,
+            MapRequestEvent, MapState, ModMask, Screen, SetMode, StackMode, UnmapNotifyEvent,
+            Window,
         },
         Event,
     },
@@ -30,11 +28,9 @@ use x11rb::{
 
 use crate::{
     config::Config,
-    wm_model::{Dimensionable, Positionable, WmState},
+    wm_state::WmState,
     x::{Error, Result},
 };
-
-use log::error;
 
 #[derive(
     AsRefStr, EnumIter, EnumString, Hash, PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy,
@@ -291,14 +287,6 @@ impl WM {
             return;
         }
         info!("Enter window: {:#?}", event.event);
-        if let Err(e) = self
-            .conn
-            .set_input_focus(InputFocus::POINTER_ROOT, event.event, CURRENT_TIME)
-            .unwrap()
-            .check()
-        {
-            error!("Failed to set input focus: {}", e)
-        }
         info!(
             "Set focus to: {} - frame: {:#?} - main: {:#?}",
             event.event,
